@@ -52,15 +52,21 @@ function Write-Log {
 #region ------ HTML PARSING HELPERS --------------------------------------------
 
 function Get-HiddenField {
-    # Pulls value="..." out of <input type="hidden" class="X" value="...">
     param([string]$Html, [string]$ClassName)
-    if ($Html -match "class=`"$ClassName`"\s+value=`"([^`"]*)`"") { return $matches[1] }
+    # 1. First, find the HTML tag that contains the required class
+    if ($Html -match "(?i)<[^>]*class\s*=\s*['`"]$ClassName['`"][^>]*>") {
+        $tag = $matches[0]
+        # 2. Extract the value attribute from that specific tag, regardless of order
+        if ($tag -match "(?i)value\s*=\s*['`"]([^'`"]*)['`"]") {
+            return $matches[1]
+        }
+    }
     return ''
 }
 
 function Get-LectureFields {
     param([string]$Html)
-    [pscustomobject]@{
+    $fields = [pscustomobject]@{
         CourseId       = Get-HiddenField $Html 'course_id'
         LectureId      = Get-HiddenField $Html 'lecture_id'
         EnrollmentId   = Get-HiddenField $Html 'enrollment_id'
@@ -69,6 +75,15 @@ function Get-LectureFields {
         NextRoute      = Get-HiddenField $Html 'nextLectureRoute'
         NextId         = Get-HiddenField $Html 'nextLectureId'
     }
+
+    # Fallback: If it couldn't find the hidden field, look for a standard 'Next' hyperlink
+    if (-not $fields.NextRoute) {
+        if ($Html -match '(?i)<a[^>]+href\s*=\s*["'']([^"'']+)["''][^>]*>.*?Next.*?</a>') {
+            $fields.NextRoute = $matches[1]
+        }
+    }
+    
+    return $fields
 }
 
 #endregion --------------------------------------------------------------------
@@ -262,7 +277,16 @@ function Start-EdutainerSkipper {
                 $totalFailed++
             }
 
-            if (-not $fields.NextRoute) { break }
+            if (-not $fields.NextRoute) { 
+    Write-Host "    [!] Stopped: No 'Next' route found after lecture $($fields.LectureId)." -ForegroundColor Yellow
+    Write-Host "    [!] This usually means you hit a Quiz, Assignment, or the Course is finished." -ForegroundColor DarkGray
+    Write-Log "Missing NextRoute after Lecture $($fields.LectureId). Dumping HTML snippet for review." 'WARN'
+    
+    # Save a snippet of the HTML to the log file so you can see what the script saw
+    $snippetLength = [math]::Min(1000, $page.Content.Length)
+    Write-Log $page.Content.Substring(0, $snippetLength) 'DEBUG'
+    break 
+}
 
             try {
                 $page = Get-Page -Session $session -Url $fields.NextRoute
