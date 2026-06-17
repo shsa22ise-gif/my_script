@@ -215,7 +215,7 @@ function Start-EdutainerSkipper {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
     $courseIndex = 0
-    foreach ($courseUrl in $Config.CourseUrls) {
+foreach ($courseUrl in $Config.CourseUrls) {
         $courseIndex++
         Write-Host "  Course $courseIndex/$($Config.CourseUrls.Count)" -ForegroundColor White
         Write-Host "    $courseUrl" -ForegroundColor DarkGray
@@ -230,80 +230,66 @@ function Start-EdutainerSkipper {
             continue
         }
 
-        $fields = Get-LectureFields -Html $page.Content
+        # --- NEW LOGIC: Harvest all lecture links from the sidebar/menu ---
+        # This regex looks for any URL in the page containing 'lecture_uuid' or 'lecture_id'
+        $linkRegex = [System.Text.RegularExpressions.Regex]::new('href\s*=\s*["'']([^"'']+(?:lecture_uuid|lecture_id)=[^"'']+)["'']', 'IgnoreCase')
+        $allLinks = $linkRegex.Matches($page.Content) | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
 
-        # If the bare course URL didn't land directly on a lecture page (no
-        # course_id/lecture_id hidden fields found), fall back to scanning
-        # the page for the first lecture_uuid link and following it.
-        if (-not $fields.CourseId -or -not $fields.LectureId) {
-            if ($page.Content -match 'href="([^"]+\?lecture_uuid=[^"]+)"') {
-                $firstLectureUrl = $matches[1]
-                Write-Log "Course landed on an overview page, following first lecture link: $firstLectureUrl"
-                try {
-                    $page = Get-Page -Session $session -Url $firstLectureUrl
-                    $fields = Get-LectureFields -Html $page.Content
-                }
-                catch {
-                    Write-Log "Failed to follow first lecture link: $($_.Exception.Message)" 'ERROR'
-                }
-            }
-        }
-
-        if (-not $fields.CourseId -or -not $fields.LectureId) {
-            Write-Host '    Could not find a lecture to start from - page structure may differ. Skipping.' -ForegroundColor Yellow
-            Write-Log "No lecture fields found for $courseUrl" 'WARN'
+        if ($allLinks.Count -eq 0) {
+            Write-Host '    [!] Could not find any lecture links in the course menu. The page structure might be blocking the script.' -ForegroundColor Yellow
+            Write-Log "No menu links found for $courseUrl" 'WARN'
             Write-Host ''
             continue
         }
 
+        Write-Host "    -> Found $($allLinks.Count) total items in course modules. Processing..." -ForegroundColor Cyan
+        
         $lectureCountThisCourse = 0
         $iter = 0
 
-        while ($fields.CourseId -and $fields.LectureId -and $iter -lt $Config.MaxLecturesPerCourse) {
+        # Loop through our harvested list of links instead of relying on the "Next" button
+        foreach ($link in $allLinks) {
             $iter++
-            Write-Host "    [$iter] Lecture $($fields.LectureId) " -NoNewline -ForegroundColor DarkGray
+            
+            # Format the URL just in case the site uses relative paths (e.g., /student/...)
+            $fullUrl = $link
+            if ($fullUrl -match '^/') { $fullUrl = $Config.Origin + $fullUrl }
+
+            Write-Host "    [$iter/$($allLinks.Count)] " -NoNewline -ForegroundColor DarkGray
 
             try {
+                $lecturePage = Get-Page -Session $session -Url $fullUrl
+                $fields = Get-LectureFields -Html $lecturePage.Content
+                
+                # If a link is a Quiz or Assignment, it won't have video fields. We can safely skip it.
+                if (-not $fields.CourseId -or -not $fields.LectureId) {
+                    Write-Host "SKIP (Not a video lesson)" -ForegroundColor DarkYellow
+                    continue
+                }
+
                 $resp = Complete-Lecture -Session $session -CompletedRoute $fields.CompletedRoute `
                     -CourseId $fields.CourseId -LectureId $fields.LectureId -EnrollmentId $fields.EnrollmentId
+                
                 Write-Log "Completed lecture $($fields.LectureId) (course $($fields.CourseId)): HTTP $($resp.StatusCode)"
-                Write-Host 'DONE' -ForegroundColor Green
+                Write-Host "DONE (Lecture $($fields.LectureId))" -ForegroundColor Green
+                
                 $totalCompleted++
                 $lectureCountThisCourse++
             }
             catch {
-                Write-Host 'FAIL' -ForegroundColor Red
-                Write-Log "Failed to complete lecture $($fields.LectureId): $($_.Exception.Message)" 'ERROR'
+                Write-Host "FAIL" -ForegroundColor Red
+                Write-Log "Failed to complete link $fullUrl : $($_.Exception.Message)" 'ERROR'
                 $totalFailed++
             }
-
-            if (-not $fields.NextRoute) { 
-    Write-Host "    [!] Stopped: No 'Next' route found after lecture $($fields.LectureId)." -ForegroundColor Yellow
-    Write-Host "    [!] This usually means you hit a Quiz, Assignment, or the Course is finished." -ForegroundColor DarkGray
-    Write-Log "Missing NextRoute after Lecture $($fields.LectureId). Dumping HTML snippet for review." 'WARN'
-    
-    # Save a snippet of the HTML to the log file so you can see what the script saw
-    $snippetLength = [math]::Min(1000, $page.Content.Length)
-    Write-Log $page.Content.Substring(0, $snippetLength) 'DEBUG'
-    break 
-}
-
-            try {
-                $page = Get-Page -Session $session -Url $fields.NextRoute
-                $fields = Get-LectureFields -Html $page.Content
-            }
-            catch {
-                Write-Log "Failed to load next lecture from $($fields.NextRoute): $($_.Exception.Message)" 'ERROR'
+            
+            # Safety check to prevent infinite loops if the site bugs out
+            if ($iter -ge $Config.MaxLecturesPerCourse) {
+                Write-Host "    Hit safety cap of $($Config.MaxLecturesPerCourse) lectures - stopping this course." -ForegroundColor Yellow
                 break
             }
         }
 
-        if ($iter -ge $Config.MaxLecturesPerCourse) {
-            Write-Host "    Hit safety cap of $($Config.MaxLecturesPerCourse) lectures - stopping this course early." -ForegroundColor Yellow
-            Write-Log "Hit MaxLecturesPerCourse safety cap for $courseUrl" 'WARN'
-        }
-
-        Write-Host "    -> $lectureCountThisCourse lecture(s) completed in this course" -ForegroundColor Cyan
+        Write-Host "    -> $lectureCountThisCourse video(s) completed in this course" -ForegroundColor Cyan
         Write-Host ''
     }
 
